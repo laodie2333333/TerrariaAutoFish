@@ -31,12 +31,15 @@ internal static class CatchPolicyTests
         settings.SonarFilterEnabled = true;
         var copy = settings.Copy();
         settings.SelectedCatchIds[0] = 2290;
-        Assert(CatchPolicy.CanReel(new[] { 2308 }, true, copy), "session targets are isolated from UI edits");
-        Assert(!CatchPolicy.CanReel(new[] { 2290 }, true, copy), "UI edits cannot change active session targets");
-        bool invalid = false;
-        try { new BotOptions { SonarFilterEnabled = true }.Validate(); }
-        catch (ArgumentException) { invalid = true; }
-        Assert(invalid, "empty enabled allowlist rejected");
+        Assert(CatchPolicy.CanReel(new[] { 2308 }, true, copy), "option copies own their target arrays");
+        Assert(!CatchPolicy.CanReel(new[] { 2290 }, true, copy), "array edits need an explicit bridge update");
+        var empty = new BotOptions { SonarFilterEnabled = true };
+        empty.Validate();
+        Assert(!CatchPolicy.CanReel(new[] { 2308 }, true, empty), "clearing selected targets keeps sonar filter active and rejects all fish");
+        Assert(CatchPolicy.CanReel(new[] { 2308 }, false, empty), "empty selection keeps ordinary fishing when sonar expires");
+        empty.SelectedCatchIds = null;
+        empty.Validate();
+        Assert(!CatchPolicy.CanReel(new[] { 2308 }, true, empty), "null targets also reject all sonar bites");
         new BotOptions { SonarFilterEnabled = false }.Validate();
         Console.WriteLine("PASS: " + checks + " sonar policy checks.");
     }

@@ -30,8 +30,6 @@ namespace TerrariaAutoFish
                 throw new ArgumentException("连续超时停止次数应为 1～20。");
             if (StopBelowHealthPercent < 0 || StopBelowHealthPercent > 90)
                 throw new ArgumentException("低生命停止阈值应为 0～90%。");
-            if (SonarFilterEnabled && (SelectedCatchIds == null || SelectedCatchIds.Length == 0))
-                throw new ArgumentException("请至少选择一种声纳目标，或关闭声纳筛选。");
             if (SelectedCatchIds != null && Array.Exists(SelectedCatchIds, id => id <= 0))
                 throw new ArgumentException("声纳目标必须是有效的物品 ID。");
         }
@@ -76,6 +74,8 @@ namespace TerrariaAutoFish
     public interface IBotBridge
     {
         void Start(BotOptions options);
+        void UpdateSonarFilter(bool enabled, int[] selectedCatchIds);
+        void UpdateInventoryFullStop(bool enabled);
         void Stop();
         BotSnapshot Snapshot();
         string[] DrainLog();

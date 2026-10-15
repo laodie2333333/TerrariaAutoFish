@@ -36,8 +36,6 @@ namespace TerrariaAutoFish
         private bool oldPlayWhenUnfocused;
         private bool settingsCaptured;
         private long lastPublish;
-        private long lastInventoryCheck;
-        private bool inventoryFull;
         private string lastReason;
         private bool sessionActive;
         private long sessionStarted;
@@ -110,9 +108,11 @@ namespace TerrariaAutoFish
             try
             {
                 Patch(harmony, typeof(GameMain), "Update", "BeforeUpdate", null, null);
+                Patch(harmony, typeof(GameMain), "CanPauseGame", null, "AfterCanPauseGame", null);
                 Patch(harmony, typeof(Player), "ItemCheck", "BeforeItemCheck", "AfterItemCheck", "FinallyItemCheck");
                 Patch(harmony, typeof(Player), "ItemCheck_Shoot", "BeforeShoot", null, null);
                 foreach (var target in new[] { AccessTools.DeclaredMethod(typeof(GameMain), "Update"),
+                    AccessTools.DeclaredMethod(typeof(GameMain), "CanPauseGame"),
                     AccessTools.DeclaredMethod(typeof(Player), "ItemCheck"),
                     AccessTools.DeclaredMethod(typeof(Player), "ItemCheck_Shoot") })
                 {
@@ -145,6 +145,42 @@ namespace TerrariaAutoFish
         }
 
         public void Stop() { commands.Enqueue(() => StopNow("已手动停止", false)); }
+
+        public void UpdateInventoryFullStop(bool enabled)
+        {
+            commands.Enqueue(() => {
+                if (options.StopWhenInventoryFull == enabled) return;
+                options.StopWhenInventoryFull = enabled;
+                if (engine.Enabled)
+                    WriteLog(enabled ? "背包无空格时停止已实时开启；立即检查主背包。"
+                        : "背包无空格时停止已实时关闭。");
+                Publish(true);
+            });
+        }
+
+        public void UpdateSonarFilter(bool enabled, int[] selectedCatchIds)
+        {
+            // The UI owns its array. Capture a private copy before crossing onto the game thread.
+            var ids = selectedCatchIds == null ? new int[0] : (int[])selectedCatchIds.Clone();
+            if (Array.Exists(ids, id => id <= 0))
+                throw new ArgumentException("声纳目标必须是有效的物品 ID。");
+            ids = ids.Distinct().OrderBy(id => id).ToArray();
+            commands.Enqueue(() => {
+                if (options.SonarFilterEnabled == enabled
+                    && (options.SelectedCatchIds ?? new int[0]).OrderBy(id => id).SequenceEqual(ids)) return;
+                options.SonarFilterEnabled = enabled;
+                options.SelectedCatchIds = ids;
+                // Reclassify a bite already waiting in the water against the new selection.
+                observedBites.Clear();
+                lastCatch = "筛选已更新，等待咬钩";
+                if (InWorld()) lastSonar = GameMain.LocalPlayer.sonarPotion;
+                if (engine.Enabled)
+                    WriteLog(enabled ? "声纳目标已实时更新，选择 " + ids.Length + " 项；"
+                        + (ids.Length == 0 ? "有声纳效果时跳过全部鱼获，等待选择目标。"
+                            : "后续收杆按新目标判断。") : "声纳筛选已实时关闭，恢复普通钓鱼。");
+                Publish(true);
+            });
+        }
 
         public BotSnapshot Snapshot()
         {
@@ -209,7 +245,7 @@ namespace TerrariaAutoFish
             if (!InWorld()) { WriteLog("请先进入世界，拿起钓竿并手动抛一次竿。"); return; }
             var player = GameMain.LocalPlayer;
             string unsafeReason = CheckSafety(player, settings, false);
-            if (unsafeReason != null) { WriteLog(unsafeReason); return; }
+            if (unsafeReason != null) { WriteLog(unsafeReason); StopNow(unsafeReason); return; }
             if (!hasAim || aimRod != player.HeldItem.type)
             {
                 WriteLog("尚未记录当前钓竿的抛竿方向。请在游戏中手动抛一次竿，再按 F8。");
@@ -222,8 +258,6 @@ namespace TerrariaAutoFish
             oldPlayWhenUnfocused = GameMain.SettingPlayWhenUnfocused;
             settingsCaptured = true;
             GameMain.SettingPlayWhenUnfocused = true;
-            lastInventoryCheck = 0;
-            inventoryFull = false;
             lastReason = null;
             observedBites.Clear();
             skippedCatches = 0;
@@ -269,9 +303,11 @@ namespace TerrariaAutoFish
             if (player.HeldItem == null || player.HeldItem.fishingPole <= 0) return "请手持钓竿；切换物品后会停止挂机";
             if (checkPosition && player.HeldItem.type != selectedRod) return "钓竿已改变，已停止";
             if (player.CCed || player.noItems) return "角色暂时无法使用物品，已停止";
-            if (GameMain.playerInventory || GameMain.ingameOptionsWindow || GameMain.drawingPlayerChat
-                || GameMain.editSign || GameMain.editChest || GameMain.mapFullscreen || GameMain.inFancyUI)
-                return "打开了背包、地图或交互界面，已停止";
+            if (GameMain.ingameOptionsWindow || GameMain.drawingPlayerChat
+                || GameMain.editSign || GameMain.editChest || GameMain.mapFullscreen || GameMain.inFancyUI
+                || player.chest != -1 || player.talkNPC >= 0 || player.sign >= 0 || GameMain.npcShop > 0
+                || GameMain.InGameUI.IsVisible)
+                return "打开了地图、聊天或交互界面，已停止";
             if (settings.StopBelowHealthPercent > 0 && player.statLifeMax2 > 0
                 && player.statLife * 100L <= player.statLifeMax2 * (long)settings.StopBelowHealthPercent)
                 return "生命低于设定阈值，已停止（不会暂停世界）";
@@ -284,18 +320,14 @@ namespace TerrariaAutoFish
             if (conditions.BaitItemType <= 0) return "鱼饵已用完，已停止";
             if (settings.SkipEnemies && conditions.BaitItemType == 2673)
                 return "当前首选鱼饵是松露虫；请更换普通鱼饵后开始";
-            if (settings.StopWhenInventoryFull && checkPosition)
+            if (settings.StopWhenInventoryFull)
             {
-                long now = clock.ElapsedMilliseconds;
-                if (now - lastInventoryCheck >= 1000)
-                {
-                    lastInventoryCheck = now;
-                    inventoryFull = true;
-                    // Slots 0..49 are the main inventory; dedicated coin/ammo slots do not count.
-                    for (int i = 0; i < 50; i++)
-                        if (player.inventory[i].IsAir) { inventoryFull = false; break; }
-                }
-                if (inventoryFull) return "主背包没有空格，已停止（已有物品仍可能可以堆叠）";
+                // Slots 0..49 include the hotbar and main inventory. Inspect all
+                // fifty on every safety check, including Begin and immediately
+                // before an action; a cached free slot can disappear after loot.
+                for (int i = 0; i < 50; i++)
+                    if (player.inventory[i] == null || player.inventory[i].IsAir) return null;
+                return "主背包没有空格，已停止（已有物品仍可能可以堆叠）";
             }
             return null;
         }
@@ -344,6 +376,18 @@ namespace TerrariaAutoFish
             }
         }
 
+        private static void AfterCanPauseGame(ref bool __result)
+        {
+            // Preserve the user's AutoPause preference. Only let ordinary backpack inspection
+            // continue during a bot session; options, signs and other UI keep vanilla pausing.
+            var self = current;
+            if (__result && self != null && self.engine.Enabled && self.InWorld()
+                && GameMain.netMode == 0 && GameMain.autoPause && GameMain.playerInventory
+                && !GameMain.ingameOptionsWindow && GameMain.LocalPlayer.sign < 0
+                && !GameMain.InGameUI.IsVisible)
+                __result = false;
+        }
+
         public sealed class ItemState
         {
             public bool Changed;
@@ -365,7 +409,8 @@ namespace TerrariaAutoFish
                 bool sonar = __instance.sonarPotion;
                 var bites = new List<int>();
                 var activeBites = new HashSet<int>();
-                string filterStatus = null;
+                string filterStatus = sonar && self.options.SonarFilterEnabled && self.options.SelectedCatchIds.Length == 0
+                    ? "未选择声纳目标，等待勾选（有声纳时不收杆）" : null;
                 if (self.options.SonarFilterEnabled && sonar != self.lastSonar)
                 {
                     self.WriteLog(sonar ? "声纳效果已生效，开始按目标筛选。" : "声纳效果已结束，恢复普通钓鱼。");
