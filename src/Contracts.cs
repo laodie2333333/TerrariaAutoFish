@@ -10,10 +10,14 @@ namespace TerrariaAutoFish
         public int StopBelowHealthPercent = 25;
         public bool SkipEnemies = true;
         public bool StopWhenInventoryFull = true;
+        public bool SonarFilterEnabled;
+        public int[] SelectedCatchIds = new int[0];
 
         public BotOptions Copy()
         {
-            return (BotOptions)MemberwiseClone();
+            var copy = (BotOptions)MemberwiseClone();
+            copy.SelectedCatchIds = SelectedCatchIds == null ? new int[0] : (int[])SelectedCatchIds.Clone();
+            return copy;
         }
 
         public void Validate()
@@ -26,6 +30,10 @@ namespace TerrariaAutoFish
                 throw new ArgumentException("连续超时停止次数应为 1～20。");
             if (StopBelowHealthPercent < 0 || StopBelowHealthPercent > 90)
                 throw new ArgumentException("低生命停止阈值应为 0～90%。");
+            if (SonarFilterEnabled && (SelectedCatchIds == null || SelectedCatchIds.Length == 0))
+                throw new ArgumentException("请至少选择一种声纳目标，或关闭声纳筛选。");
+            if (SelectedCatchIds != null && Array.Exists(SelectedCatchIds, id => id <= 0))
+                throw new ArgumentException("声纳目标必须是有效的物品 ID。");
         }
     }
 
@@ -43,6 +51,10 @@ namespace TerrariaAutoFish
         public long StopSequence;
         public string StopReason;
         public bool AutomaticStop;
+        public bool SonarActive;
+        public bool SonarFilterEnabled;
+        public int SkippedCatches;
+        public string LastCatch = "尚未检测到咬钩";
         public string Status = "等待游戏启动";
         public string Player = "—";
         public string Rod = "—";
@@ -53,6 +65,14 @@ namespace TerrariaAutoFish
         public DateTime LastUpdateUtc;
     }
 
+    public sealed class CatchCatalogEntry
+    {
+        public int Id;
+        public string Name;
+        public string Category;
+        public override string ToString() { return Name + "  ·  " + Category + "  #" + Id; }
+    }
+
     public interface IBotBridge
     {
         void Start(BotOptions options);
@@ -60,5 +80,6 @@ namespace TerrariaAutoFish
         BotSnapshot Snapshot();
         string[] DrainLog();
         bool IsGameForeground();
+        CatchCatalogEntry[] CatchCatalog();
     }
 }

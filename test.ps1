@@ -7,6 +7,11 @@ $testExecutable = Join-Path $testDirectory 'EngineTests.exe'
 if ($LASTEXITCODE -ne 0) { throw 'Test compilation failed.' }
 & $testExecutable
 if ($LASTEXITCODE -ne 0) { throw 'Engine tests failed.' }
+$policyTestExecutable = Join-Path $testDirectory 'CatchPolicyTests.exe'
+& $compilerPath /nologo /utf8output /codepage:65001 /platform:x86 "/out:$policyTestExecutable" (Join-Path $PSScriptRoot 'src\Contracts.cs') (Join-Path $PSScriptRoot 'src\CatchPolicy.cs') (Join-Path $PSScriptRoot 'tests\CatchPolicyTests.cs')
+if ($LASTEXITCODE -ne 0) { throw 'Catch policy test compilation failed.' }
+& $policyTestExecutable
+if ($LASTEXITCODE -ne 0) { throw 'Catch policy tests failed.' }
 $logTestExecutable = Join-Path $testDirectory 'SessionLogTests.exe'
 & $compilerPath /nologo /utf8output /codepage:65001 /platform:x86 "/out:$logTestExecutable" (Join-Path $PSScriptRoot 'src\SessionLog.cs') (Join-Path $PSScriptRoot 'tests\SessionLogTests.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Log test compilation failed.' }

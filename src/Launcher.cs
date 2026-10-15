@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -57,17 +58,49 @@ namespace TerrariaAutoFish
         }
     }
 
+    internal sealed class ThemedButton : Button
+    {
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            if (Enabled) { base.OnPaint(e); return; }
+            using (var brush = new SolidBrush(BackColor)) e.Graphics.FillRectangle(brush, ClientRectangle);
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ForeColor,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+    }
+
+    internal sealed class RoundedCard : Panel
+    {
+        public RoundedCard() { DoubleBuffered = true; BackColor = Color.Transparent; }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var rect = new Rectangle(0, 0, Width - 1, Height - 1);
+            using (var path = new GraphicsPath())
+            {
+                const int diameter = 22;
+                path.AddArc(rect.Left, rect.Top, diameter, diameter, 180, 90);
+                path.AddArc(rect.Right - diameter, rect.Top, diameter, diameter, 270, 90);
+                path.AddArc(rect.Right - diameter, rect.Bottom - diameter, diameter, diameter, 0, 90);
+                path.AddArc(rect.Left, rect.Bottom - diameter, diameter, diameter, 90, 90);
+                path.CloseFigure();
+                using (var brush = new SolidBrush(Color.FromArgb(26, 34, 48))) e.Graphics.FillPath(brush, path);
+                using (var pen = new Pen(Color.FromArgb(43, 54, 72))) e.Graphics.DrawPath(pen, path);
+            }
+            base.OnPaint(e);
+        }
+    }
+
     internal sealed class ControlPanel : Form
     {
-        private static readonly Color Background = Color.FromArgb(17, 24, 39);
-        private static readonly Color Card = Color.FromArgb(30, 41, 59);
+        private static readonly Color Background = Color.FromArgb(14, 20, 30);
         private static readonly Color TextColor = Color.FromArgb(226, 232, 240);
         private static readonly Color Muted = Color.FromArgb(148, 163, 184);
-        private static readonly Color Accent = Color.FromArgb(45, 212, 191);
+        private static readonly Color Accent = Color.FromArgb(239, 195, 104);
         private readonly TextBox pathBox = new TextBox();
-        private readonly Button launchButton = new Button();
-        private readonly Button startButton = new Button();
-        private readonly Button stopButton = new Button();
+        private readonly Button launchButton = new ThemedButton();
+        private readonly Button startButton = new ThemedButton();
+        private readonly Button stopButton = new ThemedButton();
         private readonly Label status = new Label();
         private readonly Label telemetry = new Label();
         private readonly Label heartbeat = new Label();
@@ -80,6 +113,18 @@ namespace TerrariaAutoFish
         private readonly CheckBox stopFull = new CheckBox();
         private readonly CheckBox notifyStops = new CheckBox();
         private readonly Label sessionInfo = new Label();
+        private readonly Panel page = new Panel();
+        private readonly CheckBox sonarFilter = new CheckBox();
+        private readonly TextBox catchSearch = new TextBox();
+        private readonly ComboBox catchCategory = new ComboBox();
+        private readonly CheckedListBox catchList = new CheckedListBox();
+        private readonly Label filterSummary = new Label();
+        private readonly Label sonarStatus = new Label();
+        private readonly Label stateBadge = new Label();
+        private readonly HashSet<int> selectedCatches = new HashSet<int>();
+        private CatchCatalogEntry[] catalog = new CatchCatalogEntry[0];
+        private bool updatingCatchList;
+        private bool loadingPreferences;
         private readonly NotifyIcon tray = new NotifyIcon();
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private IBotBridge bridge;
@@ -102,21 +147,28 @@ namespace TerrariaAutoFish
         [DllImport("user32.dll")]
         private static extern bool UnregisterHotKey(IntPtr handle, int id);
 
-        public ControlPanel()
+        public ControlPanel() : this(null) { }
+
+        internal ControlPanel(string dataDirectory)
         {
-            Text = "泰拉瑞亚后台钓鱼 · 1.4.5.8 · 工具 0.2.0";
-            ClientSize = new Size(920, 826);
-            MinimumSize = new Size(936, 865);
+            if (!String.IsNullOrWhiteSpace(dataDirectory)) preferencesDirectory = dataDirectory;
+            Text = "TerrariaAutoFish·自动后台钓鱼";
+            ClientSize = new Size(1080, 800);
+            MinimumSize = new Size(850, 580);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Background;
             ForeColor = TextColor;
             Font = new Font("Microsoft YaHei UI", 10f);
+            AutoScaleDimensions = new SizeF(96f, 96f);
             AutoScaleMode = AutoScaleMode.Dpi;
             using (var iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("TerrariaAutoFish.GoldenFishingRod.ico"))
             using (var appIcon = new Icon(iconStream))
                 Icon = (Icon)appIcon.Clone();
             BuildLayout();
+            loadingPreferences = true;
             LoadPreferences();
+            loadingPreferences = false;
+            RefreshCatchList();
             sessionLog = new SessionLog(Path.Combine(preferencesDirectory, "Logs"));
             AppendLog("控制面板已打开；本次运行日志会持续保存到日志文件夹。");
             if (String.IsNullOrWhiteSpace(pathBox.Text)) pathBox.Text = FindGame();
@@ -136,6 +188,8 @@ namespace TerrariaAutoFish
             FormClosing += OnClosing;
             Resize += (s, e) => { if (WindowState == FormWindowState.Minimized) Hide(); };
             Shown += (s, e) => {
+                var area = Screen.FromControl(this).WorkingArea;
+                Size = new Size(Math.Min(Width, area.Width), Math.Min(Height, area.Height));
                 f8Registered = RegisterHotKey(Handle, 8, 0x4000, (uint)Keys.F8);
                 f9Registered = RegisterHotKey(Handle, 9, 0x4000, (uint)Keys.F9);
                 AppendLog("仅支持原版 Windows / Steam Terraria 1.4.5.8。先保存退出当前游戏，再从这里启动。");
@@ -144,135 +198,387 @@ namespace TerrariaAutoFish
             };
         }
 
-        private Label LabelAt(Control parent, string text, int x, int y, int width, int height,
-            Color color, float size = 10f, FontStyle style = FontStyle.Regular)
+        private TableLayoutPanel Grid(int columns, params SizeType[] rows)
         {
-            var label = new Label { Text = text, Location = new Point(x, y), Size = new Size(width, height),
-                ForeColor = color, BackColor = Color.Transparent, Font = new Font(Font.FontFamily, size, style) };
-            parent.Controls.Add(label);
+            var grid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = columns,
+                RowCount = rows.Length, Margin = Padding.Empty, Padding = Padding.Empty,
+                BackColor = Color.Transparent, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            for (int i = 0; i < columns; i++) grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / columns));
+            foreach (var row in rows) grid.RowStyles.Add(new RowStyle(row, row == SizeType.Percent ? 100f : 0f));
+            return grid;
+        }
+
+        private Label CopyLabel(Label label, string text, Color color, float size = 10f, FontStyle style = FontStyle.Regular)
+        {
+            label.Text = text;
+            label.AutoSize = true;
+            label.Dock = DockStyle.Fill;
+            label.Margin = new Padding(0, 4, 0, 8);
+            label.ForeColor = color;
+            label.BackColor = Color.Transparent;
+            label.Font = new Font(Font.FontFamily, size, style);
+            label.UseMnemonic = false;
             return label;
         }
 
-        private void StyleButton(Button button, string text, Color background, int x, int y, int width)
+        private Label CopyLabel(string text, Color color, float size = 10f, FontStyle style = FontStyle.Regular)
+        {
+            return CopyLabel(new Label(), text, color, size, style);
+        }
+
+        private void StyleButton(Button button, string text, Color background)
         {
             button.Text = text;
-            button.SetBounds(x, y, width, 38);
+            button.Dock = DockStyle.Fill;
+            button.AutoSize = true;
+            button.AutoSizeMode = AutoSizeMode.GrowAndShrink;
+            button.MinimumSize = new Size(0, 38);
+            button.Padding = new Padding(12, 7, 12, 7);
+            button.Margin = new Padding(0, 4, 0, 4);
             button.BackColor = background;
             button.ForeColor = background == Accent ? Background : TextColor;
             button.FlatStyle = FlatStyle.Flat;
             button.FlatAppearance.BorderSize = 0;
             button.Cursor = Cursors.Hand;
             button.Font = new Font(Font.FontFamily, 10f, FontStyle.Bold);
+            button.EnabledChanged += (s, e) => {
+                button.BackColor = button.Enabled ? background : Color.FromArgb(39, 48, 63);
+                button.ForeColor = button.Enabled ? (background == Accent ? Background : TextColor) : Muted;
+            };
         }
 
-        private Panel MakeCard(int x, int y, int width, int height)
+        private Panel MakeCard(Control content)
         {
-            var panel = new Panel { Location = new Point(x, y), Size = new Size(width, height), BackColor = Card };
-            Controls.Add(panel);
-            return panel;
+            var card = new RoundedCard { Dock = DockStyle.Fill, Padding = new Padding(18),
+                Margin = Padding.Empty };
+            card.Controls.Add(content);
+            return card;
+        }
+
+        private void ConfigureCheck(CheckBox check, string text, bool initial)
+        {
+            check.Text = text;
+            check.AutoSize = true;
+            check.Dock = DockStyle.Fill;
+            check.Margin = new Padding(0, 6, 8, 6);
+            check.Checked = initial;
         }
 
         private void BuildLayout()
         {
-            LabelAt(this, "泰拉瑞亚 · 后台钓鱼", 26, 20, 610, 42, TextColor, 23f, FontStyle.Bold);
-            LabelAt(this, "1.4.5.8 专用  /  游戏内执行  /  不占用系统鼠标", 29, 66, 800, 25, Muted);
-            var gameCard = MakeCard(26, 106, 868, 100);
-            LabelAt(gameCard, "游戏启动", 16, 12, 120, 25, TextColor, 11f, FontStyle.Bold);
-            pathBox.SetBounds(16, 48, 574, 31);
+            // The outer canvas follows the viewport. Only small windows scroll; maximized windows
+            // give their extra width/height to the columns and the target list.
+            var viewport = new Panel { Dock = DockStyle.Fill, AutoScroll = true, BackColor = Background };
+            page.BackColor = Background;
+            viewport.Controls.Add(page);
+            Controls.Add(viewport);
+            var root = Grid(1, SizeType.AutoSize, SizeType.AutoSize, SizeType.Percent, SizeType.AutoSize);
+            root.AutoSize = false;
+            root.Padding = new Padding(24, 18, 24, 14);
+            page.Controls.Add(root);
+
+            var heading = Grid(3, SizeType.AutoSize);
+            heading.ColumnStyles.Clear();
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            heading.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var emblem = new PictureBox { SizeMode = PictureBoxSizeMode.Zoom, Size = new Size(46, 46),
+                Margin = new Padding(0, 10, 16, 0) };
+            using (var imageStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("TerrariaAutoFish.GoldenFishingRod.png"))
+            using (var image = new Bitmap(imageStream)) emblem.Image = new Bitmap(image);
+            heading.Controls.Add(emblem, 0, 0);
+            var title = Grid(1, SizeType.AutoSize, SizeType.AutoSize);
+            title.Controls.Add(CopyLabel("TerrariaAutoFish", TextColor, 22f, FontStyle.Bold), 0, 0);
+            title.Controls.Add(CopyLabel("泰拉瑞亚后台钓鱼  /  Steam 原版 1.4.5.8", Muted, 9f), 0, 1);
+            heading.Controls.Add(title, 1, 0);
+            heading.Controls.Add(CopyLabel("v0.3.0  ·  声纳筛选", Accent, 10f, FontStyle.Bold), 2, 0);
+            heading.Margin = new Padding(0, 0, 0, 16);
+            root.Controls.Add(heading, 0, 0);
+
+            var game = Grid(3, SizeType.AutoSize, SizeType.AutoSize);
+            game.ColumnStyles.Clear();
+            game.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            game.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            game.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            var pathLabel = CopyLabel("游戏位置", TextColor, 10f, FontStyle.Bold);
+            game.Controls.Add(pathLabel, 0, 0);
+            game.SetColumnSpan(pathLabel, 3);
+            pathBox.Dock = DockStyle.Fill;
+            pathBox.Margin = new Padding(0, 10, 14, 4);
             pathBox.BackColor = Background;
             pathBox.ForeColor = TextColor;
             pathBox.BorderStyle = BorderStyle.FixedSingle;
-            gameCard.Controls.Add(pathBox);
-            var browse = new Button();
-            StyleButton(browse, "选择…", Color.FromArgb(51, 65, 85), 600, 43, 94);
+            game.Controls.Add(pathBox, 0, 1);
+            var browse = new ThemedButton();
+            StyleButton(browse, "选择文件", Color.FromArgb(46, 58, 77));
+            browse.Margin = new Padding(0, 4, 12, 4);
             browse.Click += (s, e) => {
                 using (var dialog = new OpenFileDialog { Filter = "Terraria.exe|Terraria.exe", Title = "选择原版 Terraria.exe" })
                     if (dialog.ShowDialog(this) == DialogResult.OK) pathBox.Text = dialog.FileName;
             };
-            gameCard.Controls.Add(browse);
-            StyleButton(launchButton, "启动游戏", Accent, 706, 43, 146);
+            game.Controls.Add(browse, 1, 1);
+            StyleButton(launchButton, "启动游戏", Accent);
             launchButton.Click += (s, e) => LaunchGame();
-            gameCard.Controls.Add(launchButton);
+            game.Controls.Add(launchButton, 2, 1);
+            var gameCard = MakeCard(game);
+            gameCard.AutoSize = true;
+            gameCard.Margin = new Padding(0, 0, 0, 16);
+            root.Controls.Add(gameCard, 0, 1);
 
-            var helpCard = MakeCard(26, 222, 402, 254);
-            LabelAt(helpCard, "使用方法", 16, 14, 350, 26, TextColor, 11f, FontStyle.Bold);
-            LabelAt(helpCard, "1   从上方启动游戏，进入世界。\r\n2   拿起钓竿，手动向水面抛一次竿。\r\n3   在游戏中按 F8，接管自动钓鱼。\r\n4   切到其他窗口；按 F9 随时停止。", 16, 53, 376, 116, TextColor);
-            LabelAt(helpCard, "最小化面板后可从系统托盘打开。", 16, 174, 376, 24, Muted, 9f);
-            LabelAt(helpCard, "关闭面板会停止钓鱼；最小化则继续。", 16, 203, 376, 26, Muted, 9f);
+            var body = Grid(2, SizeType.Percent);
+            body.AutoSize = false;
+            body.ColumnStyles[0].Width = 59;
+            body.ColumnStyles[1].Width = 41;
+            root.Controls.Add(body, 0, 2);
+            var left = Grid(1, SizeType.Percent, SizeType.AutoSize);
+            left.AutoSize = false;
+            left.Margin = new Padding(0, 0, 16, 0);
+            body.Controls.Add(left, 0, 0);
 
-            var settingsCard = MakeCard(444, 222, 450, 254);
-            LabelAt(settingsCard, "挂机设置（下次开始时应用）", 16, 14, 420, 26, TextColor, 11f, FontStyle.Bold);
-            AddNumber(settingsCard, "重抛间隔 / 毫秒", recast, 300, 5000, 800, 50);
-            AddNumber(settingsCard, "无咬钩超时 / 秒", timeout, 30, 1800, 180, 86);
-            AddNumber(settingsCard, "低生命停止 / %", health, 0, 90, 25, 122);
-            AddNumber(settingsCard, "连续超时停止 / 次", maxTimeouts, 1, 20, 3, 158);
-            skipEnemies.Text = "跳过怪物咬钩";
-            skipEnemies.Checked = true;
-            skipEnemies.SetBounds(16, 198, 192, 26);
-            stopFull.Text = "背包无空格时停止";
-            stopFull.Checked = true;
-            stopFull.SetBounds(216, 198, 225, 26);
-            settingsCard.Controls.AddRange(new Control[] { skipEnemies, stopFull });
-
-            var stateCard = MakeCard(26, 492, 868, 145);
-            status.SetBounds(16, 13, 836, 27);
-            status.Text = "等待从启动器进入游戏";
-            status.ForeColor = Accent;
-            status.Font = new Font(Font.FontFamily, 11f, FontStyle.Bold);
-            stateCard.Controls.Add(status);
-            telemetry.SetBounds(16, 49, 830, 23);
-            telemetry.ForeColor = TextColor;
-            telemetry.Text = "角色 —     钓竿 —     鱼饵 —     重抛 0     咬钩收杆 0";
-            stateCard.Controls.Add(telemetry);
-            heartbeat.SetBounds(16, 80, 830, 22);
-            heartbeat.ForeColor = Muted;
-            heartbeat.Font = new Font(Font.FontFamily, 9f);
-            heartbeat.Text = "收杆次数是自动收杆操作数，实际入包物品以游戏为准。";
-            stateCard.Controls.Add(heartbeat);
-            sessionInfo.SetBounds(16, 111, 836, 25);
-            sessionInfo.ForeColor = Muted;
-            sessionInfo.Font = new Font(Font.FontFamily, 9f);
-            sessionInfo.Text = "本次挂机 00:00:00  ·  连续超时 0 次  ·  日志已开启";
-            stateCard.Controls.Add(sessionInfo);
-
-            StyleButton(startButton, "开始接管 · F8", Accent, 26, 653, 196);
-            StyleButton(stopButton, "停止钓鱼 · F9", Color.FromArgb(127, 29, 29), 234, 653, 196);
+            var state = Grid(1, SizeType.AutoSize, SizeType.AutoSize, SizeType.Percent, SizeType.AutoSize, SizeType.AutoSize);
+            state.AutoSize = false;
+            var stateHeading = Grid(2, SizeType.AutoSize);
+            stateHeading.Controls.Add(CopyLabel("钓鱼控制", TextColor, 11f, FontStyle.Bold), 0, 0);
+            CopyLabel(stateBadge, "●  等待游戏", Muted, 9f);
+            stateBadge.TextAlign = ContentAlignment.MiddleRight;
+            stateHeading.Controls.Add(stateBadge, 1, 0);
+            state.Controls.Add(stateHeading, 0, 0);
+            CopyLabel(status, "从启动器进入世界，手动抛一次竿", Accent, 12f, FontStyle.Bold);
+            status.Margin = new Padding(0, 8, 0, 12);
+            state.Controls.Add(status, 0, 1);
+            state.Controls.Add(CopyLabel(telemetry, "角色 —    生命 —    钓竿 —\r\n鱼饵 —    鱼漂 —    重抛 0    收杆 0", TextColor, 9f), 0, 3);
+            var actions = Grid(2, SizeType.AutoSize);
+            StyleButton(startButton, "开始接管   F8", Accent);
+            StyleButton(stopButton, "停止钓鱼   F9", Color.FromArgb(96, 47, 57));
+            startButton.Margin = new Padding(0, 4, 6, 0);
+            stopButton.Margin = new Padding(6, 4, 0, 0);
             startButton.Enabled = stopButton.Enabled = false;
             startButton.Click += (s, e) => StartFishing();
             stopButton.Click += (s, e) => StopFishing();
-            Controls.AddRange(new Control[] { startButton, stopButton });
-            notifyStops.Text = "自动停止时通知";
-            notifyStops.Checked = true;
-            notifyStops.SetBounds(448, 659, 210, 28);
-            notifyStops.CheckedChanged += (s, e) => SavePreferences();
-            Controls.Add(notifyStops);
-            var logsButton = new Button();
-            StyleButton(logsButton, "打开日志文件夹", Color.FromArgb(51, 65, 85), 674, 653, 220);
-            logsButton.Click += (s, e) => OpenLogs();
-            Controls.Add(logsButton);
+            actions.Controls.Add(startButton, 0, 0);
+            actions.Controls.Add(stopButton, 1, 0);
+            state.Controls.Add(actions, 0, 4);
+            var stateCard = MakeCard(state);
+            stateCard.Margin = new Padding(0, 0, 0, 16);
+            left.Controls.Add(stateCard, 0, 0);
 
-            logBox.SetBounds(26, 706, 868, 94);
-            logBox.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top | AnchorStyles.Bottom;
+            var settings = Grid(2, SizeType.AutoSize, SizeType.AutoSize, SizeType.AutoSize, SizeType.AutoSize, SizeType.AutoSize);
+            settings.Controls.Add(CopyLabel("挂机设置", TextColor, 11f, FontStyle.Bold), 0, 0);
+            var settingsHint = CopyLabel("下次开始时应用", Muted, 9f);
+            settingsHint.TextAlign = ContentAlignment.MiddleRight;
+            settings.Controls.Add(settingsHint, 1, 0);
+            settings.Controls.Add(NumberSetting("重抛间隔 / ms", recast, 300, 5000, 800), 0, 1);
+            settings.Controls.Add(NumberSetting("等待超时 / 秒", timeout, 30, 1800, 180), 1, 1);
+            settings.Controls.Add(NumberSetting("低生命停止 / %", health, 0, 90, 25), 0, 2);
+            settings.Controls.Add(NumberSetting("连续超时 / 次", maxTimeouts, 1, 20, 3), 1, 2);
+            ConfigureCheck(skipEnemies, "跳过怪物咬钩", true);
+            ConfigureCheck(stopFull, "背包无空格时停止", true);
+            ConfigureCheck(notifyStops, "自动停止时通知", true);
+            notifyStops.CheckedChanged += (s, e) => { if (!loadingPreferences) SavePreferences(); };
+            settings.Controls.Add(skipEnemies, 0, 3);
+            settings.Controls.Add(stopFull, 1, 3);
+            settings.Controls.Add(notifyStops, 0, 4);
+            var logsButton = new ThemedButton();
+            StyleButton(logsButton, "查看运行日志", Color.FromArgb(46, 58, 77));
+            logsButton.Click += (s, e) => ShowLogs();
+            settings.Controls.Add(logsButton, 1, 4);
+            var settingsCard = MakeCard(settings);
+            settingsCard.AutoSize = true;
+            left.Controls.Add(settingsCard, 0, 1);
+
+            var sonar = Grid(1, SizeType.AutoSize, SizeType.AutoSize, SizeType.AutoSize, SizeType.AutoSize,
+                SizeType.AutoSize, SizeType.Percent, SizeType.AutoSize, SizeType.AutoSize);
+            sonar.AutoSize = false;
+            var sonarHeading = Grid(2, SizeType.AutoSize);
+            sonarHeading.Controls.Add(CopyLabel("声纳目标", TextColor, 11f, FontStyle.Bold), 0, 0);
+            ConfigureCheck(sonarFilter, "启用筛选", false);
+            sonarFilter.Dock = DockStyle.Right;
+            sonarFilter.Margin = new Padding(8, 4, 0, 8);
+            sonarHeading.Controls.Add(sonarFilter, 1, 0);
+            sonar.Controls.Add(sonarHeading, 0, 0);
+            sonar.Controls.Add(CopyLabel(sonarStatus, "等待游戏 · 无声纳效果时照常收杆", Accent, 9f), 0, 1);
+            var filterHint = CopyLabel("选择下次接管的目标；其余等待咬钩结束。", Muted, 9f);
+            filterHint.Name = "filterHint";
+            sonar.Controls.Add(filterHint, 0, 2);
+            var searchHint = CopyLabel("搜索名称 / 物品 ID", Muted, 9f);
+            searchHint.Name = "searchHint";
+            searchHint.Margin = new Padding(0, 4, 0, 6);
+            sonar.Controls.Add(searchHint, 0, 3);
+            var search = Grid(2, SizeType.AutoSize);
+            search.ColumnStyles[0].Width = 60;
+            search.ColumnStyles[1].Width = 40;
+            catchSearch.Dock = DockStyle.Fill;
+            catchSearch.Margin = new Padding(0, 0, 10, 0);
+            catchSearch.BackColor = Background;
+            catchSearch.ForeColor = TextColor;
+            catchSearch.BorderStyle = BorderStyle.FixedSingle;
+            catchSearch.TextChanged += (s, e) => RefreshCatchList();
+            search.Controls.Add(catchSearch, 0, 0);
+            catchCategory.Dock = DockStyle.Fill;
+            catchCategory.Margin = Padding.Empty;
+            catchCategory.DropDownStyle = ComboBoxStyle.DropDownList;
+            catchCategory.BackColor = Background;
+            catchCategory.ForeColor = TextColor;
+            catchCategory.FlatStyle = FlatStyle.Flat;
+            catchCategory.DrawMode = DrawMode.OwnerDrawFixed;
+            catchCategory.DrawItem += (s, e) => {
+                using (var brush = new SolidBrush(Background)) e.Graphics.FillRectangle(brush, e.Bounds);
+                if (e.Index >= 0) TextRenderer.DrawText(e.Graphics, catchCategory.Items[e.Index].ToString(),
+                    catchCategory.Font, e.Bounds, TextColor, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+                e.DrawFocusRectangle();
+            };
+            catchCategory.Items.AddRange(new object[] { "全部鱼获", "宝匣", "任务鱼", "已选择" });
+            catchCategory.SelectedIndex = 0;
+            catchCategory.SelectedIndexChanged += (s, e) => RefreshCatchList();
+            search.Controls.Add(catchCategory, 1, 0);
+            search.Margin = new Padding(0, 0, 0, 14);
+            sonar.Controls.Add(search, 0, 4);
+            catchList.Dock = DockStyle.Fill;
+            catchList.Margin = new Padding(0, 0, 0, 10);
+            catchList.BackColor = Background;
+            catchList.ForeColor = TextColor;
+            catchList.BorderStyle = BorderStyle.None;
+            catchList.CheckOnClick = true;
+            catchList.IntegralHeight = false;
+            catchList.HorizontalScrollbar = true;
+            catchList.Font = new Font(Font.FontFamily, 9f);
+            catchList.ItemCheck += (s, e) => {
+                if (updatingCatchList) return;
+                var item = (CatchCatalogEntry)catchList.Items[e.Index];
+                if (e.NewValue == CheckState.Checked) selectedCatches.Add(item.Id);
+                else selectedCatches.Remove(item.Id);
+                UpdateFilterSummary();
+                if (!loadingPreferences) SavePreferences();
+                if (catchCategory.SelectedIndex == 3 && IsHandleCreated)
+                    BeginInvoke((Action)RefreshCatchList);
+            };
+            sonar.Controls.Add(catchList, 0, 5);
+            var selectionActions = Grid(2, SizeType.AutoSize);
+            var all = new ThemedButton();
+            var none = new ThemedButton();
+            StyleButton(all, "勾选当前列表", Color.FromArgb(46, 58, 77));
+            StyleButton(none, "取消当前列表", Color.FromArgb(46, 58, 77));
+            all.Margin = new Padding(0, 0, 5, 4);
+            none.Margin = new Padding(5, 0, 0, 4);
+            all.Click += (s, e) => SelectVisibleCatches(true);
+            none.Click += (s, e) => SelectVisibleCatches(false);
+            selectionActions.Controls.Add(all, 0, 0);
+            selectionActions.Controls.Add(none, 1, 0);
+            sonar.Controls.Add(selectionActions, 0, 6);
+            sonar.Controls.Add(CopyLabel(filterSummary, "", Muted, 9f), 0, 7);
+            sonarFilter.CheckedChanged += (s, e) => {
+                UpdateFilterSummary();
+                if (!loadingPreferences) SavePreferences();
+            };
+            body.Controls.Add(MakeCard(sonar), 1, 0);
+
+            var footer = Grid(1, SizeType.AutoSize, SizeType.AutoSize);
+            footer.Margin = new Padding(0, 10, 0, 0);
+            footer.Controls.Add(CopyLabel(sessionInfo, "本次挂机 00:00:00   ·   声纳跳过 0 次   ·   日志已开启", TextColor, 9f), 0, 0);
+            footer.Controls.Add(CopyLabel(heartbeat, "启动游戏 → 手动抛竿 → F8 接管   /   最小化继续，关闭面板停止", Muted, 9f), 0, 1);
+            root.Controls.Add(footer, 0, 3);
+
+            bool resizing = false;
+            viewport.Layout += (s, e) => {
+                if (resizing) return;
+                resizing = true;
+                try
+                {
+                    // Padding follows WinForms DPI scaling, including a move to a differently scaled screen.
+                    float scale = root.Padding.Left / 24f;
+                    var minimum = new Size((int)Math.Ceiling(1000 * scale), (int)Math.Ceiling(800 * scale));
+                    page.Size = new Size(Math.Max(minimum.Width, viewport.ClientSize.Width),
+                        Math.Max(minimum.Height, viewport.ClientSize.Height));
+                }
+                finally { resizing = false; }
+            };
             logBox.Multiline = true;
             logBox.ReadOnly = true;
             logBox.ScrollBars = ScrollBars.Vertical;
-            logBox.BackColor = Color.FromArgb(10, 17, 29);
-            logBox.ForeColor = Muted;
+            logBox.BackColor = Background;
+            logBox.ForeColor = TextColor;
             logBox.BorderStyle = BorderStyle.None;
             logBox.Font = new Font("Microsoft YaHei UI", 9f);
-            Controls.Add(logBox);
         }
 
-        private void AddNumber(Control parent, string text, NumericUpDown field, int min, int max, int value, int y)
+        private void ShowLogs()
         {
-            LabelAt(parent, text, 16, y + 3, 250, 25, Muted);
-            field.SetBounds(296, y, 132, 29);
+            using (var window = new Form { Text = "运行日志", Size = new Size(860, 500),
+                StartPosition = FormStartPosition.CenterParent, BackColor = Background, ForeColor = TextColor,
+                Font = Font, Icon = Icon })
+            {
+                var openFolder = new ThemedButton { Text = "打开日志文件夹", Dock = DockStyle.Bottom, Height = 42,
+                    FlatStyle = FlatStyle.Flat, BackColor = Accent, ForeColor = Background };
+                openFolder.Click += (s, e) => OpenLogs();
+                logBox.Dock = DockStyle.Fill;
+                window.Controls.Add(logBox);
+                window.Controls.Add(openFolder);
+                try { window.ShowDialog(this); }
+                finally { window.Controls.Remove(logBox); }
+            }
+        }
+
+        private Control NumberSetting(string text, NumericUpDown field, int min, int max, int value)
+        {
+            var grid = Grid(2, SizeType.AutoSize);
+            grid.ColumnStyles.Clear();
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            grid.Margin = new Padding(0, 5, 12, 5);
+            grid.Controls.Add(CopyLabel(text, Muted, 9f), 0, 0);
+            field.Dock = DockStyle.Fill;
+            field.Width = 88;
+            field.Margin = new Padding(8, 0, 0, 0);
             field.Minimum = min;
             field.Maximum = max;
             field.Value = value;
             field.BackColor = Background;
             field.ForeColor = TextColor;
-            parent.Controls.Add(field);
+            grid.Controls.Add(field, 1, 0);
+            return grid;
+        }
+
+        private void RefreshCatchList()
+        {
+            if (updatingCatchList) return;
+            updatingCatchList = true;
+            catchList.BeginUpdate();
+            try
+            {
+                catchList.Items.Clear();
+                string query = catchSearch.Text.Trim();
+                string category = catchCategory.SelectedItem as string;
+                foreach (var entry in catalog)
+                {
+                    if (query.Length > 0 && entry.Name.IndexOf(query, StringComparison.CurrentCultureIgnoreCase) < 0
+                        && !entry.Id.ToString().Contains(query)) continue;
+                    if (category == "已选择" && !selectedCatches.Contains(entry.Id)) continue;
+                    if ((category == "宝匣" || category == "任务鱼") && entry.Category != category) continue;
+                    catchList.Items.Add(entry, selectedCatches.Contains(entry.Id));
+                }
+            }
+            finally
+            {
+                catchList.EndUpdate();
+                updatingCatchList = false;
+            }
+            UpdateFilterSummary();
+        }
+
+        private void UpdateFilterSummary()
+        {
+            filterSummary.Text = catalog.Length == 0 ? "进入世界后加载鱼获列表，已保存 " + selectedCatches.Count + " 项"
+                : "已选 " + selectedCatches.Count + " 项  /  当前显示 " + catchList.Items.Count + " 项"
+                    + (sonarFilter.Checked && selectedCatches.Count == 0 ? " · 请选择目标" : "");
+            filterSummary.ForeColor = sonarFilter.Checked && selectedCatches.Count == 0 ? Accent : Muted;
+        }
+
+        private void SelectVisibleCatches(bool selected)
+        {
+            foreach (CatchCatalogEntry entry in catchList.Items)
+                if (selected) selectedCatches.Add(entry.Id); else selectedCatches.Remove(entry.Id);
+            RefreshCatchList();
+            SavePreferences();
         }
 
         private BotOptions Options()
@@ -280,14 +586,21 @@ namespace TerrariaAutoFish
             return new BotOptions { RecastDelayMs = (int)recast.Value, TimeoutSeconds = (int)timeout.Value,
                 StopBelowHealthPercent = (int)health.Value, SkipEnemies = skipEnemies.Checked,
                 MaxConsecutiveTimeouts = (int)maxTimeouts.Value,
+                SonarFilterEnabled = sonarFilter.Checked, SelectedCatchIds = selectedCatches.OrderBy(id => id).ToArray(),
                 StopWhenInventoryFull = stopFull.Checked };
         }
 
         private void StartFishing()
         {
             if (bridge == null) return;
-            SavePreferences();
-            bridge.Start(Options());
+            try
+            {
+                var options = Options();
+                options.Validate();
+                SavePreferences();
+                bridge.Start(options);
+            }
+            catch (ArgumentException ex) { MessageBox.Show(this, ex.Message, "请检查挂机设置", MessageBoxButtons.OK, MessageBoxIcon.Information); }
         }
 
         private void StopFishing()
@@ -366,6 +679,8 @@ namespace TerrariaAutoFish
                         gameRunning = false;
                         startButton.Enabled = stopButton.Enabled = false;
                         status.Text = "游戏已关闭，请重新打开启动器以再次启动";
+                        stateBadge.Text = "●  游戏已退出";
+                        stateBadge.ForeColor = Muted;
                         RestoreWindow();
                     }));
                 }
@@ -380,13 +695,24 @@ namespace TerrariaAutoFish
             if (bridge == null || !gameRunning) return;
             foreach (var entry in bridge.DrainLog()) AppendLog(entry, false);
             var state = bridge.Snapshot();
+            if (catalog.Length == 0)
+            {
+                var available = bridge.CatchCatalog();
+                if (available.Length > 0) { catalog = available; RefreshCatchList(); }
+            }
             ObserveStop(state);
             status.Text = state.Status;
             status.ForeColor = state.Enabled ? Accent : TextColor;
+            stateBadge.Text = state.Enabled ? "●  自动钓鱼中" : state.InWorld ? "●  等待接管" : "●  等待进入世界";
+            stateBadge.ForeColor = state.Enabled ? Accent : Muted;
             startButton.Enabled = state.InWorld && !state.Enabled;
             stopButton.Enabled = state.Enabled;
-            telemetry.Text = String.Format("{0}  ♥ {1}/{2}    {3}    鱼饵 {4}    鱼漂 {5}    重抛 {6}    咬钩收杆 {7}",
+            telemetry.Text = String.Format("{0}  ♥ {1}/{2}    {3}\r\n鱼饵 {4}    鱼漂 {5}    重抛 {6}    收杆 {7}",
                 state.Player, state.Health, state.MaxHealth, state.Rod, state.Bait, state.Bobbers, state.Casts, state.Reels);
+            sonarStatus.Text = state.SonarActive
+                ? (state.Enabled && state.SonarFilterEnabled ? "声纳生效 · 正在筛选" : "声纳生效 · 未启用筛选")
+                : "无声纳效果 · 按普通钓鱼收杆";
+            sonarStatus.ForeColor = state.SonarActive ? Accent : Muted;
             DateTime now = DateTime.UtcNow;
             if ((now - previousSample).TotalSeconds >= 1)
             {
@@ -410,9 +736,9 @@ namespace TerrariaAutoFish
             }
             if (!stale || !state.Enabled) updateWarningShown = false;
             var duration = TimeSpan.FromSeconds(state.SessionSeconds);
-            sessionInfo.Text = String.Format("本次挂机 {0:00}:{1:00}:{2:00}  ·  连续超时 {3} 次 / 累计 {4} 次  ·  日志{5}",
+            sessionInfo.Text = String.Format("本次挂机 {0:00}:{1:00}:{2:00}  ·  超时 {3}/{4}  ·  声纳跳过 {6} 次  ·  {7}  ·  日志{5}",
                 (int)duration.TotalHours, duration.Minutes, duration.Seconds, state.ConsecutiveTimeouts,
-                state.TotalTimeouts, logErrorShown ? "写入失败" : "已开启");
+                state.TotalTimeouts, logErrorShown ? "写入失败" : "已开启", state.SkippedCatches, state.LastCatch);
         }
 
         private void ObserveStop(BotSnapshot state)
@@ -486,7 +812,8 @@ namespace TerrariaAutoFish
                 File.WriteAllLines(Path.Combine(preferencesDirectory, "settings.txt"), new[] {
                     pathBox.Text, recast.Value.ToString(), timeout.Value.ToString(), health.Value.ToString(),
                     skipEnemies.Checked.ToString(), stopFull.Checked.ToString(),
-                    maxTimeouts.Value.ToString(), notifyStops.Checked.ToString() });
+                    maxTimeouts.Value.ToString(), notifyStops.Checked.ToString(),
+                    sonarFilter.Checked.ToString(), String.Join(",", selectedCatches.OrderBy(id => id)) });
             }
             catch (Exception ex) { AppendLog("设置未保存：" + ex.Message); }
         }
@@ -514,6 +841,13 @@ namespace TerrariaAutoFish
                 if (values.Length > 6 && Decimal.TryParse(values[6], out limit))
                     maxTimeouts.Value = Math.Min(maxTimeouts.Maximum, Math.Max(maxTimeouts.Minimum, limit));
                 if (values.Length > 7 && Boolean.TryParse(values[7], out setting)) notifyStops.Checked = setting;
+                if (values.Length > 8 && Boolean.TryParse(values[8], out setting)) sonarFilter.Checked = setting;
+                if (values.Length > 9)
+                    foreach (string token in values[9].Split(','))
+                    {
+                        int id;
+                        if (Int32.TryParse(token, out id) && id > 0) selectedCatches.Add(id);
+                    }
             }
             catch { }
         }

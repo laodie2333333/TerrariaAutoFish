@@ -40,7 +40,18 @@ internal static class EngineTests
         var skippedBite = Observe(1);
         skippedBite.BiteActive = true;
         Assert(engine.Tick(skippedBite, 181000) == FishingAction.None, "timeout does not reel a skipped monster bite");
-        Assert(engine.Tick(Observe(1), 182000) == FishingAction.ResetLine, "timeout recovers after skipped bite ends");
+        Assert(engine.Tick(Observe(1), 182000) == FishingAction.None, "skipping a bite renews the wait without a forced reel");
+        Assert(engine.Tick(Observe(1), 361000) == FishingAction.ResetLine, "a full idle timeout still recovers after skipped bite ends");
+
+        engine.Start(options, 0);
+        engine.Tick(Observe(1), 200);
+        var filtered = Observe(1);
+        filtered.BiteActive = true;
+        filtered.FilterStatus = "filtered";
+        for (int i = 1; i < 10; i++)
+            Assert(engine.Tick(filtered, 180000L * i) == FishingAction.None, "rejected sonar bites never force timeout reels");
+        Assert(engine.ConsecutiveTimeouts == 0 && engine.Reels == 0 && engine.Status == "filtered", "deliberate skips are not failed waits or catches");
+        Assert(engine.Tick(Observe(1, true), 1621000) == FishingAction.Reel, "an allowed bite is caught after deliberate skips");
 
         engine.Start(options, 0);
         for (int i = 0; i < 5; i++) engine.Tick(Observe(0), 1000 + 2000 * i);

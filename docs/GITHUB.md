@@ -2,7 +2,7 @@
 
 推荐仓库名：`TerrariaAutoFish`。源码放仓库，编译好的便携 ZIP 放 Releases。
 
-本机已准备 `dist/TerrariaAutoFish-0.2.0-source.zip` 供网页上传使用。修改源码后可运行 `powershell -ExecutionPolicy Bypass -File .\tools\Package-Source.ps1` 重新生成；该脚本按目录白名单收集文件，包含 `.github`，排除开发缓存和游戏检查输出。
+本机已准备 `dist/TerrariaAutoFish-0.3.0-source.zip` 供网页上传使用。修改源码后可运行 `powershell -ExecutionPolicy Bypass -File .\tools\Package-Source.ps1` 重新生成；该脚本按目录白名单收集文件，包含 `.github`，排除开发缓存和游戏检查输出。
 
 ## 方法一：GitHub 网页上传
 
@@ -24,7 +24,7 @@
 git status --short
 git add .
 git diff --cached --stat
-git commit -m "Prepare TerrariaAutoFish 0.2.0"
+git commit -m "Prepare TerrariaAutoFish 0.3.0"
 git branch -M main
 git remote add origin https://github.com/YOUR_NAME/TerrariaAutoFish.git
 git push -u origin main
@@ -39,10 +39,10 @@ git push -u origin main
 ## 发布可直接运行的程序
 
 1. 仓库页面右侧 **Releases → Create a new release**。
-2. 创建标签 `v0.2.0`，标题可写 `v0.2.0 — 后台挂机稳定性改进`，填写更新说明。
+2. 创建标签 `v0.3.0`，标题可写 `v0.3.0 — 声纳鱼获筛选与界面改进`，填写更新说明。
 3. 上传 `dist/TerrariaAutoFish-1.4.5.8.zip`，点击 **Publish release**。
 
-用户在 Release 下载并完整解压 ZIP，然后运行 EXE；GitHub 自动生成的 **Source code** ZIP 只有源码，不能直接作为成品运行。版本号 `0.2.0` 是工具版本，`1.4.5.8` 是适配的 Terraria 版本。
+用户在 Release 下载并完整解压 ZIP，然后运行 EXE；GitHub 自动生成的 **Source code** ZIP 只有源码，不能直接作为成品运行。版本号 `0.3.0` 是工具版本，`1.4.5.8` 是适配的 Terraria 版本。
 
 GitHub Actions 仅运行无需游戏的逻辑和日志检查；完整编译和游戏启动验证需要本机正版 Terraria / XNA，不会把游戏文件上传到 CI。初次公开发布建议标记为 **pre-release**，因为多人和长时间后台挂机仍待验证。
 

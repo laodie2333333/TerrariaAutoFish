@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using HarmonyLib;
 using TerrariaAutoFish;
@@ -68,6 +69,16 @@ internal static class StartupWindowProbe
     {
         if (menuDrawn && ++menuUpdates == 30)
         {
+            // Verify the installed game's catalog after content/localization initialization.
+            bridge.GetType().GetMethod("LoadCatchCatalog", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(bridge, null);
+            var catches = bridge.CatchCatalog();
+            if (catches.Length < 50 || catches.Any(entry => entry.Id <= 0 || String.IsNullOrWhiteSpace(entry.Name))
+                || catches.Select(entry => entry.Id).Distinct().Count() != catches.Length
+                || !catches.Any(entry => entry.Category == "宝匣") || !catches.Any(entry => entry.Category == "任务鱼"))
+                throw new Exception("Fishing catalog did not contain unique named fish, crates and quest fish.");
+            File.WriteAllLines(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "catch-catalog.txt"),
+                catches.Select(entry => entry.Id + "\t" + entry.Category + "\t" + entry.Name));
+            File.AppendAllText(report, "PASS: Loaded " + catches.Length + " named fishing targets, including crates and quest fish.\r\n");
             File.AppendAllText(report, "PASS: Menu completed 30 updates; ShowSplash="
                 + Terraria.Main.showSplash + "; elapsed=" + elapsed.Elapsed.TotalSeconds.ToString("F1") + "s.\r\n");
             Terraria.Main.WeGameRequireExitGame();

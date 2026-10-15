@@ -1,7 +1,7 @@
 param([string]$OutputPath)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
-if (!$OutputPath) { $OutputPath = Join-Path $projectRoot 'dist\TerrariaAutoFish-0.2.0-source.zip' }
+if (!$OutputPath) { $OutputPath = Join-Path $projectRoot 'dist\TerrariaAutoFish-0.3.0-source.zip' }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutputPath)
 Add-Type -AssemblyName System.IO.Compression

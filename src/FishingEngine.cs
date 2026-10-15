@@ -13,6 +13,7 @@ namespace TerrariaAutoFish
         public bool WaitingBobber;
         public bool CatchReady;
         public bool BiteActive;
+        public string FilterStatus;
     }
 
     // Time is supplied by the caller, so background frame rate does not change cooldowns.
@@ -75,7 +76,9 @@ namespace TerrariaAutoFish
                     return FishingAction.None;
                 }
                 if (deployedAt < 0) deployedAt = now;
-                Status = observation.WaitingBobber ? "等待咬钩（可切换到其他窗口）" : "鱼漂正在返回";
+                // Deliberately passing a bite is normal activity, not an idle timeout.
+                if (observation.BiteActive) deployedAt = now;
+                Status = observation.FilterStatus ?? (observation.WaitingBobber ? "等待咬钩（可切换到其他窗口）" : "鱼漂正在返回");
                 if (now < nextAction || !observation.CanUse) return FishingAction.None;
                 if (observation.CatchReady)
                 {

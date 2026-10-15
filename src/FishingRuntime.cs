@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
@@ -44,6 +46,11 @@ namespace TerrariaAutoFish
         private string stopReason;
         private bool automaticStop;
         private volatile IntPtr gameHandle;
+        private CatchCatalogEntry[] catchCatalog = new CatchCatalogEntry[0];
+        private readonly Dictionary<int, int> observedBites = new Dictionary<int, int>();
+        private int skippedCatches;
+        private string lastCatch = "尚未检测到咬钩";
+        private bool lastSonar;
 
         [DllImport("user32.dll")]
         private static extern IntPtr GetForegroundWindow();
@@ -157,6 +164,32 @@ namespace TerrariaAutoFish
             return gameHandle != IntPtr.Zero && GetForegroundWindow() == gameHandle;
         }
 
+        public CatchCatalogEntry[] CatchCatalog()
+        {
+            lock (snapshotLock) return (CatchCatalogEntry[])catchCatalog.Clone();
+        }
+
+        private void LoadCatchCatalog()
+        {
+            if (catchCatalog.Length != 0 || GameMain.FishDropsDB == null) return;
+            // Read the installed version's full drop catalog, without rolling or changing drops.
+            var rules = AccessTools.Field(GameMain.FishDropsDB.GetType(), "_rules").GetValue(GameMain.FishDropsDB)
+                as IEnumerable<Terraria.GameContent.FishDropRules.FishDropRule>;
+            if (rules == null) throw new InvalidOperationException("无法读取游戏鱼获目录。");
+            var ids = new SortedSet<int>(rules.SelectMany(rule => rule.PossibleItems ?? new int[0]).Where(id => id > 0));
+            foreach (int id in GameMain.anglerQuestItemNetIDs) ids.Add(id);
+            var entries = new List<CatchCatalogEntry>();
+            foreach (int id in ids)
+            {
+                var item = new Item();
+                item.SetDefaults(id);
+                entries.Add(new CatchCatalogEntry { Id = id, Name = item.Name,
+                    Category = item.questItem ? "任务鱼" : Terraria.ID.ItemID.Sets.IsFishingCrate[id] ? "宝匣" : "鱼获" });
+            }
+            lock (snapshotLock) catchCatalog = entries.OrderBy(entry => entry.Category).ThenBy(entry => entry.Name).ToArray();
+            WriteLog("声纳鱼获目录已加载，共 " + entries.Count + " 项；名称跟随游戏语言。");
+        }
+
         private void WriteLog(string message)
         {
             log.Enqueue(DateTime.Now.ToString("HH:mm:ss") + "  " + message);
@@ -192,11 +225,18 @@ namespace TerrariaAutoFish
             lastInventoryCheck = 0;
             inventoryFull = false;
             lastReason = null;
+            observedBites.Clear();
+            skippedCatches = 0;
+            lastCatch = "尚未检测到咬钩";
+            lastSonar = player.sonarPotion;
             engine.Start(options, clock.ElapsedMilliseconds);
             sessionActive = true;
             sessionStarted = clock.ElapsedMilliseconds;
             sessionFinished = sessionStarted;
             WriteLog("后台钓鱼已开启，可以切换到其他窗口。F9 随时停止。");
+            if (options.SonarFilterEnabled)
+                WriteLog("声纳筛选已开启，选择 " + options.SelectedCatchIds.Length + " 项；"
+                    + (lastSonar ? "当前有声纳效果。" : "当前无声纳效果，按普通钓鱼收杆。"));
             Publish(true);
         }
 
@@ -212,8 +252,8 @@ namespace TerrariaAutoFish
                 stopReason = reason;
                 automaticStop = automatic;
                 WriteLog(reason);
-                WriteLog(String.Format("本次挂机 {0} 秒；抛竿 {1} 次；咬钩收杆 {2} 次；等待超时 {3} 次。",
-                    (sessionFinished - sessionStarted) / 1000, engine.Casts, engine.Reels, engine.TotalTimeouts));
+                WriteLog(String.Format("本次挂机 {0} 秒；抛竿 {1} 次；咬钩收杆 {2} 次；等待超时 {3} 次；声纳跳过 {4} 次。",
+                    (sessionFinished - sessionStarted) / 1000, engine.Casts, engine.Reels, engine.TotalTimeouts, skippedCatches));
             }
             if (settingsCaptured)
             {
@@ -283,6 +323,7 @@ namespace TerrariaAutoFish
                     }
                 }
                 if (!self.InWorld()) self.hasAim = false;
+                else self.LoadCatchCatalog();
                 self.Publish(false);
             }
             catch (Exception ex) { current.Fail(ex); }
@@ -320,7 +361,16 @@ namespace TerrariaAutoFish
                 string reason = self.CheckSafety(__instance, self.options, true);
                 if (reason != null) { self.StopNow(reason); return; }
                 int bobbers = 0;
-                bool waiting = false, ready = false, biteActive = false, enemyBite = false;
+                bool waiting = false;
+                bool sonar = __instance.sonarPotion;
+                var bites = new List<int>();
+                var activeBites = new HashSet<int>();
+                string filterStatus = null;
+                if (self.options.SonarFilterEnabled && sonar != self.lastSonar)
+                {
+                    self.WriteLog(sonar ? "声纳效果已生效，开始按目标筛选。" : "声纳效果已结束，恢复普通钓鱼。");
+                    self.lastSonar = sonar;
+                }
                 foreach (var projectile in GameMain.projectile)
                 {
                     if (projectile == null || !projectile.active || !projectile.bobber
@@ -330,16 +380,36 @@ namespace TerrariaAutoFish
                     waiting = true;
                     if (projectile.ai[1] < 0f && projectile.localAI[1] != 0f)
                     {
-                        biteActive = true;
-                        if (projectile.localAI[1] < 0f) enemyBite = true;
-                        if (!self.options.SkipEnemies || projectile.localAI[1] > 0f) ready = true;
+                        int id = (int)projectile.localAI[1];
+                        bites.Add(id);
+                        activeBites.Add(projectile.whoAmI);
+                        bool rejected = sonar && self.options.SonarFilterEnabled &&
+                            (id < 0 || Array.IndexOf(self.options.SelectedCatchIds, id) < 0);
+                        int previous;
+                        if (!self.observedBites.TryGetValue(projectile.whoAmI, out previous) || previous != id)
+                        {
+                            self.observedBites[projectile.whoAmI] = id;
+                            if (sonar)
+                            {
+                                string name = id > 0 ? Terraria.Lang.GetItemNameValue(id) : "怪物咬钩";
+                                self.lastCatch = name + (rejected ? " · 已跳过" : " · 已识别");
+                                if (rejected)
+                                {
+                                    self.skippedCatches++;
+                                    self.WriteLog("声纳跳过：" + name + "；等待本次咬钩结束。");
+                                }
+                            }
+                        }
+                        if (rejected) filterStatus = "非目标咬钩，等待结束后继续（不收杆）";
                     }
                 }
-                // A use-item action reels every bobber. Do not pull another bobber's monster.
-                if (self.options.SkipEnemies && enemyBite) ready = false;
+                foreach (int key in self.observedBites.Keys.Where(key => !activeBites.Contains(key)).ToArray())
+                    self.observedBites.Remove(key);
+                bool ready = CatchPolicy.CanReel(bites, sonar, self.options);
                 var observation = new FishingObservation {
                     CanUse = __instance.itemAnimation == 0 && __instance.itemTime == 0 && __instance.reuseDelay == 0,
-                    Bobbers = bobbers, WaitingBobber = waiting, CatchReady = ready, BiteActive = biteActive
+                    Bobbers = bobbers, WaitingBobber = waiting, CatchReady = ready, BiteActive = bites.Count > 0,
+                    FilterStatus = filterStatus
                 };
                 var action = self.engine.Tick(observation, self.clock.ElapsedMilliseconds);
                 if (action == FishingAction.Stop) { self.StopNow(self.engine.Status); return; }
@@ -419,11 +489,13 @@ namespace TerrariaAutoFish
                 ConsecutiveTimeouts = engine.ConsecutiveTimeouts, TotalTimeouts = engine.TotalTimeouts,
                 SessionSeconds = ((sessionActive ? now : sessionFinished) - sessionStarted) / 1000,
                 StopSequence = stopSequence, StopReason = stopReason, AutomaticStop = automaticStop,
+                SonarFilterEnabled = options.SonarFilterEnabled, SkippedCatches = skippedCatches, LastCatch = lastCatch,
                 UpdateCount = GameMain.GameUpdateCount, LastUpdateUtc = DateTime.UtcNow
             };
             if (inWorld)
             {
                 var player = GameMain.LocalPlayer;
+                next.SonarActive = player.sonarPotion;
                 next.Player = player.name;
                 next.Rod = player.HeldItem.fishingPole > 0 ? player.HeldItem.Name : "未手持钓竿";
                 next.Health = player.statLife;
